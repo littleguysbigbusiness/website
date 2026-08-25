@@ -1,95 +1,490 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Interactive Cloud Browser</title>
-    <style>
-        body { font-family: sans-serif; margin: 0; padding: 10px; background: #222; color: #fff; }
-        .controls { display: flex; gap: 10px; margin-bottom: 10px; max-width: 1280px; margin: 0 auto 10px auto; }
-        input { flex: 1; padding: 10px; border-radius: 4px; border: none; font-size: 16px; }
-        button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: bold; }
-        button:hover { background: #218838; }
-        .browser-container { position: relative; width: 100%; max-width: 1280px; margin: 0 auto; overflow: hidden; }
-        #browser-view { width: 100%; display: block; border: 2px solid #444; background: #fff; cursor: crosshair; }
-        .loading-overlay { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); justify-content: center; align-items: center; font-size: 24px; font-weight: bold; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloud Browser</title>
+<style>
+  :root {
+    --ink: #0b0e13;
+    --panel: #141920;
+    --line: #232b36;
+    --text: #dbe3ec;
+    --muted: #6f7b8a;
+    --live: #f2544b;
+    --capture: #f0b429;
+    --focus: #4cc2ff;
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--ink);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  .shell { max-width: 1280px; margin: 0 auto; }
+
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .nav-group { display: flex; gap: 4px; }
+
+  button {
+    padding: 9px 14px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    line-height: 1;
+  }
+  button:hover { border-color: #37414f; background: #1a212a; }
+  button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
+  button.primary:hover { background: #2a7bf5; }
+  .nav-group button { min-width: 40px; padding: 9px 10px; }
+
+  #url {
+    flex: 1;
+    min-width: 0;
+    padding: 9px 12px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: 13px var(--mono);
+  }
+  #url:focus { outline: none; border-color: var(--focus); }
+
+  .stage {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border: 2px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: border-color .15s;
+  }
+  .stage:focus { outline: none; }
+  .stage.captured { border-color: var(--capture); }
+
+  #screen {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+    touch-action: none;
+  }
+
+  .hint {
+    position: absolute;
+    inset: auto 0 0 0;
+    padding: 10px 12px;
+    background: linear-gradient(transparent, rgba(0,0,0,.75));
+    color: #cfd8e3;
+    font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+    transition: opacity .2s;
+  }
+  .stage.captured .hint { opacity: 0; }
+
+  /* Telemetry rail: everything you need to trust the stream, nothing else. */
+  .rail {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    align-items: center;
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: 12px var(--mono);
+    color: var(--muted);
+  }
+  .rail b { color: var(--text); font-weight: 500; }
+  .rail .spacer { flex: 1; }
+
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--muted);
+    vertical-align: baseline;
+  }
+  .dot.on { background: var(--live); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot.on { animation: none; } }
+
+  #kbd-state.on { color: var(--capture); }
+
+  #error {
+    display: none;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid #5c2b2b;
+    border-radius: 6px;
+    background: #1e1213;
+    color: #ffb4ae;
+    font-size: 13px;
+  }
+
+  #mobile-input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+    left: -9999px;
+  }
+
+  @media (max-width: 640px) {
+    body { padding: 8px; }
+    .toolbar { flex-wrap: wrap; }
+    #url { order: -1; width: 100%; flex-basis: 100%; }
+  }
+</style>
 </head>
 <body>
+<div class="shell">
 
-    <div class="controls">
-        <input type="text" id="url-input" value="https://example.com" placeholder="Enter URL to browse securely...">
-        <button onclick="goToUrl()">Go</button>
+  <div class="toolbar">
+    <div class="nav-group">
+      <button id="back" title="Back">&#8592;</button>
+      <button id="forward" title="Forward">&#8594;</button>
+      <button id="reload" title="Reload">&#8635;</button>
     </div>
+    <input id="url" type="text" value="https://example.com" spellcheck="false"
+           autocomplete="off" placeholder="Type a URL or a search">
+    <button class="primary" id="go">Open</button>
+    <button id="keyboard" title="Show the on-screen keyboard">Keyboard</button>
+  </div>
 
-    <div class="browser-container">
-        <img id="browser-view" src="" alt="Live Cloud Stream" onclick="handleBrowserClick(event)">
-        <div id="loading" class="loading-overlay">Updating Stream...</div>
-    </div>
+  <div class="stage" id="stage" tabindex="0">
+    <canvas id="screen" width="1280" height="720"></canvas>
+    <div class="hint" id="hint">Click the screen to send your keystrokes to it. Click outside to stop.</div>
+  </div>
 
-    <script>
-        const view = document.getElementById('browser-view');
-        const loading = document.getElementById('loading');
-        const urlInput = document.getElementById('url-input');
+  <div class="rail">
+    <span><i class="dot" id="live-dot"></i><b id="conn">Connecting</b></span>
+    <span><b id="fps">0</b> fps</span>
+    <span><b id="kbps">0</b> kB/s</span>
+    <span><b id="rtt">–</b> ms</span>
+    <span id="kbd-state">keyboard idle</span>
+    <span class="spacer"></span>
+    <span id="res">1280&times;720</span>
+  </div>
 
-        function showLoading(state) {
-            loading.style.display = state ? 'flex' : 'none';
-        }
+  <div id="error"></div>
+  <input id="mobile-input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
 
-        function updateDisplay(data) {
-            if (data.screenshot) view.src = data.screenshot;
-            if (data.currentUrl) urlInput.value = data.currentUrl;
-        }
+</div>
 
-        async function goToUrl() {
-            showLoading(true);
-            try {
-                const response = await fetch('/navigate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: urlInput.value })
-                });
-                const data = await response.json();
-                updateDisplay(data);
-            } catch (err) {
-                alert('Connection error during navigation.');
-            } finally {
-                showLoading(false);
-            }
-        }
+<script>
+(function () {
+  'use strict';
 
-        async function handleBrowserClick(event) {
-            showLoading(true);
-            
-            // Calculate where the user clicked relative to the displayed image box
-            const rect = view.getBoundingClientRect();
-            const clickX = event.clientX - rect.left;
-            const clickY = event.clientY - rect.top;
+  var stage = document.getElementById('stage');
+  var canvas = document.getElementById('screen');
+  var ctx = canvas.getContext('2d', { alpha: false });
+  var urlInput = document.getElementById('url');
+  var errorBox = document.getElementById('error');
+  var mobileInput = document.getElementById('mobile-input');
 
-            // Map the layout coordinates directly to the server's 1280x720 canvas
-            const scaleX = 1280 / rect.width;
-            const scaleY = 720 / rect.height;
+  var REMOTE_W = 1280;
+  var REMOTE_H = 720;
 
-            const targetX = Math.round(clickX * scaleX);
-            const targetY = Math.round(clickY * scaleY);
+  var socket = null;
+  var connected = false;
+  var captured = false;
+  var retryDelay = 500;
 
-            try {
-                const response = await fetch('/click', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ x: targetX, y: targetY })
-                });
-                const data = await response.json();
-                updateDisplay(data);
-            } catch (err) {
-                alert('Failed to transmit action click.');
-            } finally {
-                showLoading(false);
-            }
-        }
+  /* ------------------------------------------------------------ transport */
 
-        // Initialize view frame
-        window.onload = goToUrl;
-    </script>
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(proto + '//' + location.host + '/stream');
+    socket.binaryType = 'blob';
+
+    socket.onopen = function () {
+      connected = true;
+      retryDelay = 500;
+      setStatus('Live', true);
+      hideError();
+    };
+
+    socket.onclose = function () {
+      connected = false;
+      setStatus('Reconnecting', false);
+      setTimeout(connect, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 8000);
+    };
+
+    socket.onmessage = function (event) {
+      if (typeof event.data === 'string') return handleControl(JSON.parse(event.data));
+      queueFrame(event.data);
+    };
+  }
+
+  function send(msg) {
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+  }
+
+  function handleControl(msg) {
+    if (msg.type === 'location') {
+      if (document.activeElement !== urlInput) urlInput.value = msg.url;
+      document.title = msg.title ? msg.title + ' — Cloud Browser' : 'Cloud Browser';
+    } else if (msg.type === 'hello') {
+      REMOTE_W = msg.width;
+      REMOTE_H = msg.height;
+      canvas.width = REMOTE_W;
+      canvas.height = REMOTE_H;
+      document.getElementById('res').textContent = REMOTE_W + '\u00d7' + REMOTE_H;
+    } else if (msg.type === 'error') {
+      showError(msg.message);
+    } else if (msg.type === 'pong') {
+      document.getElementById('rtt').textContent = Math.round(performance.now() - msg.t);
+    }
+  }
+
+  /* -------------------------------------------------------------- decoding */
+  // Always draw the newest frame; a frame that arrives while we're still
+  // decoding replaces the one waiting, so we never build up a backlog.
+
+  var pendingFrame = null;
+  var decoding = false;
+  var frameCount = 0;
+  var byteCount = 0;
+
+  function queueFrame(blob) {
+    byteCount += blob.size;
+    pendingFrame = blob;
+    drawNext();
+  }
+
+  function drawNext() {
+    if (decoding || !pendingFrame) return;
+    decoding = true;
+    var blob = pendingFrame;
+    pendingFrame = null;
+
+    createImageBitmap(blob).then(function (bitmap) {
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      frameCount++;
+      decoding = false;
+      drawNext();
+    }).catch(function () {
+      decoding = false;
+    });
+  }
+
+  setInterval(function () {
+    document.getElementById('fps').textContent = frameCount;
+    document.getElementById('kbps').textContent = Math.round(byteCount / 1024);
+    frameCount = 0;
+    byteCount = 0;
+    if (connected) send({ type: 'ping', t: performance.now() });
+  }, 1000);
+
+  /* ------------------------------------------------------------ status ui */
+
+  function setStatus(label, live) {
+    document.getElementById('conn').textContent = label;
+    document.getElementById('live-dot').classList.toggle('on', !!live);
+  }
+
+  function showError(text) {
+    errorBox.textContent = text;
+    errorBox.style.display = 'block';
+  }
+
+  function hideError() {
+    errorBox.style.display = 'none';
+  }
+
+  /* ----------------------------------------------------------- navigation */
+
+  function go() {
+    hideError();
+    send({ type: 'navigate', url: urlInput.value });
+    stage.focus();
+  }
+
+  document.getElementById('go').addEventListener('click', go);
+  document.getElementById('back').addEventListener('click', function () { send({ type: 'back' }); });
+  document.getElementById('forward').addEventListener('click', function () { send({ type: 'forward' }); });
+  document.getElementById('reload').addEventListener('click', function () { send({ type: 'reload' }); });
+
+  urlInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') go();
+    e.stopPropagation();
+  });
+
+  /* ---------------------------------------------------------------- mouse */
+
+  function toRemote(e) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.round((e.clientX - rect.left) * (REMOTE_W / rect.width)),
+      y: Math.round((e.clientY - rect.top) * (REMOTE_H / rect.height))
+    };
+  }
+
+  function modifiers(e) {
+    return { alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey };
+  }
+
+  function sendMouse(action, e, extra) {
+    var pos = toRemote(e);
+    var msg = {
+      type: 'mouse',
+      action: action,
+      x: pos.x,
+      y: pos.y,
+      button: e.button,
+      buttons: e.buttons,
+      modifiers: modifiers(e)
+    };
+    if (extra) for (var k in extra) msg[k] = extra[k];
+    send(msg);
+  }
+
+  var lastMove = 0;
+  canvas.addEventListener('mousemove', function (e) {
+    var now = performance.now();
+    if (now - lastMove < 33) return; // ~30 moves/sec is plenty for hover states
+    lastMove = now;
+    sendMouse('move', e);
+  });
+
+  canvas.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    stage.focus();
+    sendMouse('down', e, { clickCount: e.detail || 1 });
+  });
+
+  canvas.addEventListener('mouseup', function (e) {
+    e.preventDefault();
+    sendMouse('up', e, { clickCount: e.detail || 1 });
+  });
+
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    sendMouse('wheel', e, { deltaX: e.deltaX, deltaY: e.deltaY });
+  }, { passive: false });
+
+  /* ------------------------------------------------------------- keyboard */
+
+  // event.keyCode is deprecated but Chrome still wants a virtual key code.
+  var KEYCODES = {
+    Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18, Escape: 27,
+    ' ': 32, PageUp: 33, PageDown: 34, End: 35, Home: 36,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+    Insert: 45, Delete: 46, Meta: 91
+  };
+
+  function keyCodeFor(e) {
+    if (e.keyCode) return e.keyCode;
+    if (KEYCODES[e.key]) return KEYCODES[e.key];
+    if (e.key.length === 1) return e.key.toUpperCase().charCodeAt(0);
+    return 0;
+  }
+
+  function setCaptured(on) {
+    captured = on;
+    stage.classList.toggle('captured', on);
+    var label = document.getElementById('kbd-state');
+    label.textContent = on ? 'keyboard captured' : 'keyboard idle';
+    label.classList.toggle('on', on);
+  }
+
+  stage.addEventListener('focus', function () { setCaptured(true); });
+  stage.addEventListener('blur', function () { setCaptured(false); });
+
+  function forwardKey(action, e) {
+    send({
+      type: 'key',
+      action: action,
+      key: e.key,
+      code: e.code,
+      keyCode: keyCodeFor(e),
+      location: e.location,
+      repeat: e.repeat,
+      modifiers: modifiers(e)
+    });
+  }
+
+  stage.addEventListener('keydown', function (e) {
+    if (!captured) return;
+    // Leave devtools alone; everything else belongs to the remote page.
+    if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && e.key === 'I')) return;
+    if (e.ctrlKey && e.altKey && e.key.toLowerCase() === 'k') {
+      stage.blur();
+      return;
+    }
+    e.preventDefault();
+    forwardKey('down', e);
+  });
+
+  stage.addEventListener('keyup', function (e) {
+    if (!captured) return;
+    e.preventDefault();
+    forwardKey('up', e);
+  });
+
+  stage.addEventListener('paste', function (e) {
+    e.preventDefault();
+    var text = (e.clipboardData || window.clipboardData).getData('text');
+    if (text) send({ type: 'text', text: text });
+  });
+
+  /* ----------------------------------------------- on-screen keyboard (mobile) */
+
+  document.getElementById('keyboard').addEventListener('click', function () {
+    mobileInput.focus();
+    setCaptured(true);
+  });
+
+  mobileInput.addEventListener('input', function () {
+    if (mobileInput.value) {
+      send({ type: 'text', text: mobileInput.value });
+      mobileInput.value = '';
+    }
+  });
+
+  // Backspace and Enter never reach 'input', so forward them as real key events.
+  mobileInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Backspace' || e.key === 'Enter' || e.key.indexOf('Arrow') === 0) {
+      e.preventDefault();
+      forwardKey('down', e);
+      forwardKey('up', e);
+    }
+  });
+
+  mobileInput.addEventListener('blur', function () {
+    if (document.activeElement !== stage) setCaptured(false);
+  });
+
+  /* ----------------------------------------------------------------- boot */
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  connect();
+})();
+</script>
 </body>
 </html>
