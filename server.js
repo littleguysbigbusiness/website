@@ -20,6 +20,7 @@ const EVERY_NTH_FRAME = Number(process.env.EVERY_NTH_FRAME) || 1; // 2 = half ra
 const IDLE_REFRESH_MS = Number(process.env.IDLE_REFRESH_MS) || 2000;
 const START_URL = process.env.START_URL || 'https://example.com';
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024; // drop frames for clients this far behind
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 5; // one headless page per visitor — cap it
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -28,10 +29,13 @@ const USER_AGENT =
 /* ------------------------------------------------------------------- state */
 
 let browser = null;
-let page = null;
-let cdp = null;
-let lastFrameAt = 0;
-const clients = new Set();
+// Every connected visitor gets their own Puppeteer page + CDP session, so two
+// people on the site no longer drive the same tab.
+const sessions = new Map(); // ws -> { page, cdp, lastFrameAt }
+
+// The legacy stateless /navigate, /click, /type routes have no notion of
+// "which visitor" — they share one dedicated session, created on first use.
+let restSession = null;
 
 /* ------------------------------------------------------------- http server */
 
@@ -53,68 +57,95 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/stream' });
+// Frames are already-compressed JPEG and control messages are tiny — deflate
+// just burns CPU on both ends for no benefit. Off = lower latency, less load.
+const wss = new WebSocketServer({ server, path: '/stream', perMessageDeflate: false });
 
-/* -------------------------------------------------------------- broadcast */
+// Nagle's algorithm batches small packets for ~40ms before sending — great for
+// bulk transfer, bad for an interactive stream. Every connection on this
+// server is either a video frame or an input event, so turn it off globally.
+server.on('connection', (socket) => socket.setNoDelay(true));
+
+/* ---------------------------------------------------------------- sending */
 
 function sendJSON(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function broadcastJSON(obj) {
-  const payload = JSON.stringify(obj);
-  for (const ws of clients) {
-    if (ws.readyState === ws.OPEN) ws.send(payload);
-  }
-}
-
 // Frames go out as raw binary JPEG — no base64, ~25% less bytes on the wire.
-function broadcastFrame(buffer) {
-  lastFrameAt = Date.now();
-  for (const ws of clients) {
-    if (ws.readyState !== ws.OPEN) continue;
-    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) continue; // slow client: skip frame
-    ws.send(buffer);
-  }
+function sendFrame(ws, session, buffer) {
+  session.lastFrameAt = Date.now();
+  if (ws.readyState !== ws.OPEN) return;
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) return; // slow client: skip frame
+  ws.send(buffer);
 }
 
-async function broadcastLocation() {
-  if (!page) return;
+async function sendLocation(ws, session) {
+  const { page } = session;
   let title = '';
   try {
     title = await page.title();
   } catch (_) {
     /* page may be mid-navigation */
   }
-  broadcastJSON({ type: 'location', url: page.url(), title });
+  sendJSON(ws, { type: 'location', url: page.url(), title });
 }
 
 /* ---------------------------------------------------------------- browser */
 
-async function attachPage(target) {
-  page = target;
+async function initBrowser() {
+  browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
+      // Nothing here changes page rendering — it's all Chrome's own background
+      // busywork (telemetry, sync, update checks, throttling) that a
+      // throwaway headless instance gets zero benefit from paying for.
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-ipc-flooding-protection',
+      '--disable-domain-reliability',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-first-run',
+      // Audio is never captured or sent to the client, so decoding/mixing it
+      // server-side is pure wasted CPU — mute it at the source.
+      '--mute-audio',
+    ],
+  });
+  console.log('Headless Chrome ready.');
+}
+
+// One page + CDP screencast per visitor. `onFrame` receives raw JPEG buffers,
+// `onLocation` fires on navigation so callers can push a `location` message.
+async function createSession({ onFrame, onLocation }) {
+  if (!browser) throw new Error('Browser is not ready yet.');
+
+  const page = await browser.newPage();
   await page.setUserAgent(USER_AGENT);
   await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
-  try {
-    await page.bringToFront();
-  } catch (_) {}
 
-  if (cdp) {
-    try {
-      await cdp.detach();
-    } catch (_) {}
-    cdp = null;
-  }
-
-  cdp = await page.createCDPSession();
+  const cdp = await page.createCDPSession();
   await cdp.send('Page.enable');
 
+  const session = { page, cdp, lastFrameAt: 0 };
+
   // Chrome pushes a frame every time the page paints — this is the "video".
-  cdp.on('Page.screencastFrame', async (frame) => {
-    try {
-      await cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId });
-    } catch (_) {}
-    broadcastFrame(Buffer.from(frame.data, 'base64'));
+  // Ack unblocks Chrome to send the *next* frame, so fire it immediately
+  // rather than waiting on the round-trip before delivering this one — that
+  // was serializing every frame behind an extra network hop for no reason.
+  cdp.on('Page.screencastFrame', (frame) => {
+    cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
+    onFrame(Buffer.from(frame.data, 'base64'));
   });
 
   await cdp.send('Page.startScreencast', {
@@ -126,61 +157,36 @@ async function attachPage(target) {
   });
 
   page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) broadcastLocation();
+    if (frame === page.mainFrame()) onLocation();
   });
-  page.on('load', broadcastLocation);
+  page.on('load', onLocation);
 
-  broadcastLocation();
-}
-
-async function initBrowser() {
-  browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
-    ],
-  });
-
-  await attachPage(await browser.newPage());
-
-  // Links that open a new tab would otherwise stream nothing — follow them.
-  browser.on('targetcreated', async (target) => {
-    if (target.type() !== 'page') return;
+  // A target=_blank link would otherwise open a page nobody is streaming —
+  // pull it back into this visitor's own tab instead of losing it.
+  page.on('popup', async (popup) => {
     try {
-      const opened = await target.page();
-      if (opened) await attachPage(opened);
-    } catch (err) {
-      console.error('Could not follow new tab:', err.message);
-    }
-  });
-
-  browser.on('targetdestroyed', async (target) => {
-    if (target.type() !== 'page' || !page || !page.isClosed()) return;
-    const pages = await browser.pages();
-    const survivor = pages.find((p) => !p.isClosed());
-    if (survivor) await attachPage(survivor);
+      const url = popup.url();
+      await popup.close().catch(() => {});
+      if (url && url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    } catch (_) {}
   });
 
   try {
     await page.goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
   } catch (_) {}
 
-  console.log('Headless Chrome ready.');
+  return session;
 }
 
-// The screencast only fires on repaint, so a still page sends nothing.
-// This keeps late joiners and idle sessions from staring at a blank canvas.
-setInterval(async () => {
-  if (!page || clients.size === 0) return;
-  if (Date.now() - lastFrameAt < IDLE_REFRESH_MS) return;
+async function destroySession(session) {
+  if (!session) return;
   try {
-    broadcastFrame(await page.screenshot({ type: 'jpeg', quality: FRAME_QUALITY }));
+    await session.cdp.detach();
   } catch (_) {}
-}, IDLE_REFRESH_MS);
+  try {
+    if (!session.page.isClosed()) await session.page.close();
+  } catch (_) {}
+}
 
 /* ------------------------------------------------------------------ input */
 
@@ -194,8 +200,8 @@ function modifierMask(m) {
 // Keys whose text payload Chrome needs but the browser reports as a name.
 const KEY_TEXT = { Enter: '\r', NumpadEnter: '\r', Tab: '\t' };
 
-async function dispatchKey(msg) {
-  if (!cdp) return;
+async function dispatchKey(session, msg) {
+  const { cdp } = session;
   const key = String(msg.key || '');
   const code = String(msg.code || '');
   const location = Number(msg.location) || 0;
@@ -229,8 +235,8 @@ const MOUSE_TYPES = {
 };
 const MOUSE_BUTTONS = ['left', 'middle', 'right', 'back', 'forward'];
 
-async function dispatchMouse(msg) {
-  if (!cdp) return;
+async function dispatchMouse(session, msg) {
+  const { cdp } = session;
   const type = MOUSE_TYPES[msg.action];
   if (!type) return;
 
@@ -273,35 +279,35 @@ function resolveUrl(raw) {
   return 'https://' + input;
 }
 
-async function navigate(raw) {
+async function navigate(ws, session, raw) {
   const url = resolveUrl(raw);
-  broadcastJSON({ type: 'status', state: 'loading', url });
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  broadcastJSON({ type: 'status', state: 'ready' });
-  await broadcastLocation();
+  sendJSON(ws, { type: 'status', state: 'loading', url });
+  await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  sendJSON(ws, { type: 'status', state: 'ready' });
+  await sendLocation(ws, session);
 }
 
 /* -------------------------------------------------------------- websocket */
 
-async function handleMessage(msg, ws) {
+async function handleMessage(msg, ws, session) {
   switch (msg.type) {
     case 'navigate':
-      return navigate(msg.url);
+      return navigate(ws, session, msg.url);
     case 'back':
-      await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      return broadcastLocation();
+      await session.page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      return sendLocation(ws, session);
     case 'forward':
-      await page.goForward({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      return broadcastLocation();
+      await session.page.goForward({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      return sendLocation(ws, session);
     case 'reload':
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      return broadcastLocation();
+      await session.page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      return sendLocation(ws, session);
     case 'key':
-      return dispatchKey(msg);
+      return dispatchKey(session, msg);
     case 'mouse':
-      return dispatchMouse(msg);
+      return dispatchMouse(session, msg);
     case 'text': // paste, and mobile on-screen keyboards
-      return cdp.send('Input.insertText', { text: String(msg.text || '') });
+      return session.cdp.send('Input.insertText', { text: String(msg.text || '') });
     case 'ping':
       return sendJSON(ws, { type: 'pong', t: msg.t });
     default:
@@ -310,18 +316,36 @@ async function handleMessage(msg, ws) {
 }
 
 wss.on('connection', async (ws) => {
-  clients.add(ws);
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
 
+  if (sessions.size >= MAX_SESSIONS) {
+    sendJSON(ws, { type: 'error', message: 'The cloud browser is at capacity — try again shortly.' });
+    ws.close();
+    return;
+  }
+
+  let session;
+  try {
+    session = await createSession({
+      onFrame: (buf) => sendFrame(ws, session, buf),
+      onLocation: () => sendLocation(ws, session),
+    });
+  } catch (err) {
+    sendJSON(ws, { type: 'error', message: 'Could not start a browser session: ' + err.message });
+    ws.close();
+    return;
+  }
+
+  sessions.set(ws, session);
   sendJSON(ws, { type: 'hello', width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
-  broadcastLocation();
+  await sendLocation(ws, session);
 
   // Show the joiner the current page immediately instead of waiting for a repaint.
   try {
-    const frame = await page.screenshot({ type: 'jpeg', quality: FRAME_QUALITY });
+    const frame = await session.page.screenshot({ type: 'jpeg', quality: FRAME_QUALITY });
     if (ws.readyState === ws.OPEN) ws.send(frame);
   } catch (_) {}
 
@@ -334,21 +358,37 @@ wss.on('connection', async (ws) => {
       return;
     }
     try {
-      await handleMessage(msg, ws);
+      await handleMessage(msg, ws, session);
     } catch (err) {
       sendJSON(ws, { type: 'error', message: err.message });
     }
   });
 
-  ws.on('close', () => clients.delete(ws));
-  ws.on('error', () => clients.delete(ws));
+  const cleanup = () => {
+    sessions.delete(ws);
+    destroySession(session);
+  };
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 });
 
+// The screencast only fires on repaint, so a still page sends nothing.
+// This keeps late joiners and idle sessions from staring at a blank canvas.
+setInterval(async () => {
+  for (const [ws, session] of sessions) {
+    if (ws.readyState !== ws.OPEN) continue;
+    if (Date.now() - session.lastFrameAt < IDLE_REFRESH_MS) continue;
+    try {
+      const buf = await session.page.screenshot({ type: 'jpeg', quality: FRAME_QUALITY });
+      sendFrame(ws, session, buf);
+    } catch (_) {}
+  }
+}, IDLE_REFRESH_MS);
+
 const heartbeat = setInterval(() => {
-  for (const ws of clients) {
+  for (const ws of sessions.keys()) {
     if (!ws.isAlive) {
-      clients.delete(ws);
-      ws.terminate();
+      ws.terminate(); // triggers 'close' above, which tears down the session
       continue;
     }
     ws.isAlive = false;
@@ -357,13 +397,22 @@ const heartbeat = setInterval(() => {
 }, 30000);
 
 /* ----------------------------------------------------- legacy REST routes */
-// Kept so anything still calling the old endpoints keeps working.
+// Kept so anything still calling the old endpoints keeps working. They all
+// share one dedicated session rather than a per-visitor one, since a bare
+// HTTP request has no persistent connection to key a session off of.
+
+async function getRestSession() {
+  if (restSession && !restSession.page.isClosed()) return restSession;
+  restSession = await createSession({ onFrame: () => {}, onLocation: () => {} });
+  return restSession;
+}
 
 app.post('/navigate', async (req, res) => {
   try {
-    await navigate(req.body.url);
-    const shot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: FRAME_QUALITY });
-    res.json({ screenshot: `data:image/jpeg;base64,${shot}`, currentUrl: page.url() });
+    const session = await getRestSession();
+    await navigate({ readyState: -1 /* no ws to notify */ }, session, req.body.url);
+    const shot = await session.page.screenshot({ encoding: 'base64', type: 'jpeg', quality: FRAME_QUALITY });
+    res.json({ screenshot: `data:image/jpeg;base64,${shot}`, currentUrl: session.page.url() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -375,10 +424,11 @@ app.post('/click', async (req, res) => {
     if (x === undefined || y === undefined) {
       return res.status(400).json({ error: 'Coordinates missing' });
     }
-    await page.mouse.click(clamp(x, 0, VIEWPORT_WIDTH), clamp(y, 0, VIEWPORT_HEIGHT));
+    const session = await getRestSession();
+    await session.page.mouse.click(clamp(x, 0, VIEWPORT_WIDTH), clamp(y, 0, VIEWPORT_HEIGHT));
     await new Promise((r) => setTimeout(r, 500));
-    const shot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: FRAME_QUALITY });
-    res.json({ screenshot: `data:image/jpeg;base64,${shot}`, currentUrl: page.url() });
+    const shot = await session.page.screenshot({ encoding: 'base64', type: 'jpeg', quality: FRAME_QUALITY });
+    res.json({ screenshot: `data:image/jpeg;base64,${shot}`, currentUrl: session.page.url() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -386,7 +436,8 @@ app.post('/click', async (req, res) => {
 
 app.post('/type', async (req, res) => {
   try {
-    await cdp.send('Input.insertText', { text: String(req.body.text || '') });
+    const session = await getRestSession();
+    await session.cdp.send('Input.insertText', { text: String(req.body.text || '') });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -406,7 +457,11 @@ initBrowser()
 
 async function shutdown() {
   clearInterval(heartbeat);
-  for (const ws of clients) ws.close();
+  for (const [ws, session] of sessions) {
+    ws.close();
+    await destroySession(session);
+  }
+  if (restSession) await destroySession(restSession);
   if (browser) await browser.close().catch(() => {});
   process.exit(0);
 }
