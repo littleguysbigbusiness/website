@@ -131,45 +131,61 @@ async function createSession({ onFrame, onLocation }) {
   if (!browser) throw new Error('Browser is not ready yet.');
 
   const page = await browser.newPage();
-  await page.setUserAgent(USER_AGENT);
-  await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
 
-  const cdp = await page.createCDPSession();
-  await cdp.send('Page.enable');
+  // Every step below can throw. If any of them do, `page` already exists as
+  // a live Chrome process — without this, a failed setup leaks it forever.
+  // Enough failed connection attempts (e.g. a client retry-looping while the
+  // server is under load) and that leak alone can OOM the whole service.
+  try {
+    await page.setUserAgent(USER_AGENT);
+    await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
 
-  const session = { page, cdp, lastFrameAt: 0 };
+    const cdp = await page.createCDPSession();
+    await cdp.send('Page.enable');
 
-  // Chrome pushes a frame every time the page paints — this is the "video".
-  // Ack unblocks Chrome to send the *next* frame, so fire it immediately
-  // rather than waiting on the round-trip before delivering this one — that
-  // was serializing every frame behind an extra network hop for no reason.
-  cdp.on('Page.screencastFrame', (frame) => {
-    cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
-    onFrame(Buffer.from(frame.data, 'base64'));
-  });
+    const session = { page, cdp, lastFrameAt: 0 };
 
-  await cdp.send('Page.startScreencast', {
-    format: 'jpeg',
-    quality: FRAME_QUALITY,
-    maxWidth: VIEWPORT_WIDTH,
-    maxHeight: VIEWPORT_HEIGHT,
-    everyNthFrame: EVERY_NTH_FRAME,
-  });
+    // Chrome pushes a frame every time the page paints — this is the "video".
+    // Ack unblocks Chrome to send the *next* frame, so fire it immediately
+    // rather than waiting on the round-trip before delivering this one — that
+    // was serializing every frame behind an extra network hop for no reason.
+    cdp.on('Page.screencastFrame', (frame) => {
+      cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {});
+      onFrame(Buffer.from(frame.data, 'base64'));
+    });
 
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) onLocation();
-  });
-  page.on('load', onLocation);
+    await cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: FRAME_QUALITY,
+      maxWidth: VIEWPORT_WIDTH,
+      maxHeight: VIEWPORT_HEIGHT,
+      everyNthFrame: EVERY_NTH_FRAME,
+    });
 
-  // A target=_blank link would otherwise open a page nobody is streaming —
-  // pull it back into this visitor's own tab instead of losing it.
-  page.on('popup', async (popup) => {
-    try {
-      const url = popup.url();
-      await popup.close().catch(() => {});
-      if (url && url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    } catch (_) {}
-  });
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) onLocation();
+    });
+    page.on('load', onLocation);
+
+    // A target=_blank link would otherwise open a page nobody is streaming —
+    // pull it back into this visitor's own tab instead of losing it.
+    page.on('popup', async (popup) => {
+      try {
+        const url = popup.url();
+        await popup.close().catch(() => {});
+        if (url && url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+      } catch (_) {}
+    });
+
+    return await finishSession(session);
+  } catch (err) {
+    await page.close().catch(() => {});
+    throw err;
+  }
+}
+
+async function finishSession(session) {
+  const { page } = session;
 
   try {
     await page.goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
